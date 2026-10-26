@@ -1,0 +1,182 @@
+services:
+  # =========================================================================
+  # 1. PostgreSQL 16 Database
+  # Hosts isolated logical databases: db_keelstream_core, db_keycloak, db_frappe, db_n8n
+  # =========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: keelstream-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-keelstream}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-keelstream_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-db_keelstream_core}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db:/docker-entrypoint-initdb.d:ro
+    networks:
+      - keelstream-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-keelstream} -d ${POSTGRES_DB:-db_keelstream_core}"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # =========================================================================
+  # 2. Redis 7
+  # In-memory store for high-throughput caching and durable task queue buffering
+  # =========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: keelstream-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - keelstream-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # =========================================================================
+  # 3. MinIO S3-Compatible Object Storage
+  # Stores immutable raw touchpoint assets, report exports, and DLQ payloads
+  # =========================================================================
+  minio:
+    image: rustfs/rustfs:latest
+    container_name: keelstream-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      RUSTFS_ACCESS_KEY: ${AWS_ACCESS_KEY_ID:-minioadmin}
+      RUSTFS_SECRET_KEY: ${AWS_SECRET_ACCESS_KEY:-minioadmin}
+    ports:
+      - "${S3_PORT:-9000}:9000"
+      - "${S3_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - rustfs-data:/data
+    networks:
+      - keelstream-net
+    healthcheck:
+      test: ["CMD", "sh", "-ec", "curl -fsS http://localhost:9000/health && curl -fsS http://localhost:9001/rustfs/console/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
+  # =========================================================================
+  # 4. Keycloak 24+ IAM & OIDC Provider
+  # Enterprise authentication, multi-tenant realm claims, and token exchange
+  # =========================================================================
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0.5
+    container_name: keelstream-keycloak
+    restart: unless-stopped
+    command: start-dev --import-realm
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/${KEYCLOAK_DB_NAME:-db_keycloak}
+      KC_DB_USERNAME: ${POSTGRES_USER:-keelstream}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-keelstream_secret}
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      KC_HTTP_PORT: 8080
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_HTTPS: "false"
+      KC_HTTP_RELATIVE_PATH: /
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${KEYCLOAK_PORT:-8080}:8080"
+    volumes:
+      - ./config/keycloak:/opt/keycloak/data/import:ro
+    networks:
+      - keelstream-net
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # =========================================================================
+  # 5. KeelStream Frontend
+  # Vue attribution dashboard
+  # =========================================================================
+  frontend:
+    build:
+      context: ./frontend
+    container_name: keelstream-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    networks:
+      - keelstream-net
+
+  # =========================================================================
+  # 6. n8n Workflow Automation Engine (Placeholder / Staged Service)
+  # Low-code integration pipeline & recurring RevOps orchestration
+  # Run via: docker compose --profile workflows up -d
+  # =========================================================================
+  n8n:
+    #image: docker.n8n.io/n8nio/n8n:latest
+    image: n8nio/n8n:latest
+    container_name: keelstream-n8n
+    restart: unless-stopped
+    profiles:
+      - workflows
+      - full
+    environment:
+      N8N_PORT: ${N8N_PORT:-5678}
+      N8N_PROTOCOL: http
+      NODE_ENV: development
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-keelstream_n8n_secret_key_12345}
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${N8N_DB_NAME:-db_n8n}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER:-keelstream}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD:-keelstream_secret}
+      WEBHOOK_URL: http://localhost:${N8N_PORT:-5678}/
+      GENERIC_TIMEZONE: UTC
+      N8N_SECURE_COOKIE: "false"
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER:-n8n_user}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD:-n8n_password}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - keelstream-net
+
+volumes:
+  postgres_data:
+    name: keelstream_postgres_data
+  redis_data:
+    name: keelstream_redis_data
+  rustfs-data:
+    name: keelstream_rustfs-data
+  n8n_data:
+    name: keelstream_n8n_data
+
+networks:
+  keelstream-net:
+    name: keelstream-net
+    driver: bridge
